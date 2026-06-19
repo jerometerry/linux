@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR GPL-2.0-only */
 
-#ifndef _up_H_
-#define _up_H_
+#ifndef _USEEPLUS_CORE_H_
+#define _USEEPLUS_CORE_H_
 
 #include "useeplus_protocol.h"
 #include <linux/types.h>
@@ -13,6 +13,13 @@
 #include <linux/kfifo.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-v4l2.h>
+
+#define USB_DRIVER_NAME "useeplus"
+#define CAP_DRIVER "useeplus"
+#define CAP_CARD "useeplus protocol cameras"
+#define V4L2_INPUT_NAME "Camera Lens Channel 0"
+#define VIDEO_QUEUE_NAME "useeplus-queue"
+#define VIDEO_DEVICE_NAME "useeplus-video"
 
 /* Global Protocol Constant Macros */
 #define NUM_URBS 4
@@ -27,6 +34,14 @@
 /* Global Diagnostic String Macro */
 #define DIAG_DATA_FORMAT \
 	"URBs:%lu Err:%lu Pkt:%lu Frm:%lu Deliv:%lu D-SOI:%lu D-EOI:%lu D-Q:%lu Ghost:%lu\n"
+
+enum up_config {
+	HB_BUF_SIZE = 512,
+	HB_SINK_COUNT = 30,
+	HB_SINK_TO = 100,
+	DIAG_LOG_ITERATIONS = 300,
+	USB_TO = 1000,
+};
 
 /**
  * struct up_buffer - Queue wrapper mapping videobuf2 elements to internal lists
@@ -102,4 +117,4 @@ struct up_drv_data {
 	unsigned long dbg_usb_errors;
 };
 
-#endif /* _up_H_ */
+#endif /* _USEEPLUS_CORE_H_ */
