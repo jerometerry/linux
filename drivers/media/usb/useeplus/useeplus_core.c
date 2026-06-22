@@ -75,7 +75,8 @@ static int up_enum_input(struct file *file, void *priv, struct v4l2_input *inp)
 static int up_enum_frameintervals(struct file *file, void *priv,
 				  struct v4l2_frmivalenum *fival)
 {
-	struct up_drv_data *drv_data = video_drvdata(file);
+	unsigned int i;
+	bool size_supported = false;
 
 	if (fival->index > 0)
 		return -EINVAL;
@@ -83,8 +84,15 @@ static int up_enum_frameintervals(struct file *file, void *priv,
 	if (fival->pixel_format != V4L2_PIX_FMT_MJPEG)
 		return -EINVAL;
 
-	if (fival->width != drv_data->v4l2.width ||
-	    fival->height != drv_data->v4l2.height)
+	for (i = 0; i < ARRAY_SIZE(up_sizes); i++) {
+		if (fival->width == up_sizes[i].width &&
+		    fival->height == up_sizes[i].height) {
+			size_supported = true;
+			break;
+		}
+	}
+
+	if (!size_supported)
 		return -EINVAL;
 
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
@@ -94,20 +102,23 @@ static int up_enum_frameintervals(struct file *file, void *priv,
 	return 0;
 }
 
+static const struct v4l2_frmsize_discrete up_sizes[] = {
+	{ 640,  480 },
+	{ 320,  240 },
+	{ 1280, 720 },
+};
+
 static int up_enum_framesizes(struct file *file, void *priv,
 			      struct v4l2_frmsizeenum *fsize)
 {
-	struct up_drv_data *drv_data = video_drvdata(file);
-
-	if (fsize->index > 0)
-		return -EINVAL;
-
 	if (fsize->pixel_format != V4L2_PIX_FMT_MJPEG)
 		return -EINVAL;
 
+	if (fsize->index >= ARRAY_SIZE(up_sizes))
+		return -EINVAL;
+
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = drv_data->v4l2.width;
-	fsize->discrete.height = drv_data->v4l2.height;
+	fsize->discrete = up_sizes[fsize->index];
 
 	return 0;
 }
@@ -123,9 +134,7 @@ static int up_enum_fmt_vid_cap(struct file *file, void *priv,
 	return 0;
 }
 
-/*
- * The camera only supports 640x480 MJPEG.
- */
+
 static void up_enforce_format(struct up_drv_data *drv_data,
 			      struct v4l2_format *f)
 {
@@ -148,14 +157,94 @@ static int up_try_fmt_vid_cap(struct file *file, void *priv,
 	return 0;
 }
 
-static int up_s_fmt_vid_cap(struct file *file, void *priv,
-			    struct v4l2_format *f)
+static int up_set_hardware_resolution(struct up_drv_data *drv_data, u8 frame_index, u32 target_fps)
+{
+	struct usb_device *u_dev = drv_data->usb.udev;
+	int pipe_out = usb_sndctrlpipe(u_dev, 0);
+	u32 frame_interval;
+	int retval;
+	u8 *buf;
+
+	buf = kzalloc(26, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	/* Calculate UVC frame interval units: 10,000,000 / FPS */
+	if (target_fps == 0)
+		target_fps = 30; /* Fallback baseline protection */
+	frame_interval = 10000000 / target_fps;
+
+	buf[0] = 0x01; /* bmHint Low Byte (flags frame interval selection) */
+	buf[1] = 0x00;
+	buf[2] = 0x02; /* bFormatIndex (Fixed to 2 for MJPEG container) */
+	buf[3] = frame_index;
+
+	buf[4] = (frame_interval & 0xFF);
+	buf[5] = ((frame_interval >> 8) & 0xFF);
+	buf[6] = ((frame_interval >> 16) & 0xFF);
+	buf[7] = ((frame_interval >> 24) & 0xFF);
+
+	dev_info(&u_dev->dev, "Negotiating camera pipeline via Interface %d (Mode %d)...\n",
+             UP_VIDEO_INTERFACE, frame_index);
+
+	retval = usb_control_msg(u_dev, pipe_out,
+				 0x01, 0x21,
+				 0x0100, UP_VIDEO_INTERFACE,
+				 buf, 26, USB_CTRL_SET_TIMEOUT);
+	if (retval < 0) {
+		dev_err(&u_dev->dev, "Hardware stream probe stalled: %d\n", retval);
+		goto out;
+	}
+
+	retval = usb_control_msg(u_dev, pipe_out,
+				 0x01, 0x21,
+				 0x0200, UP_VIDEO_INTERFACE,
+				 buf, 26, USB_CTRL_SET_TIMEOUT);
+	if (retval < 0) {
+		dev_err(&u_dev->dev, "Hardware stream commit lock stalled: %d\n", retval);
+		goto out;
+	}
+
+	retval = 0;
+
+out:
+	kfree(buf);
+	return retval;
+}
+
+static int up_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct up_drv_data *drv_data = video_drvdata(file);
+	u8 target_hardware_index;
+
+	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	if (vb2_is_busy(&drv_data->v4l2.queue))
+		return -EBUSY;
+
+	if (f->fmt.pix.width >= 1280 || f->fmt.pix.height >= 720) {
+		target_hardware_index = 3;
+		drv_data->v4l2.width = 1280;
+		drv_data->v4l2.height = 720;
+	} else if (f->fmt.pix.width <= 320 || f->fmt.pix.height <= 240) {
+		target_hardware_index = 2;
+		drv_data->v4l2.width = 320;
+		drv_data->v4l2.height = 240;
+	} else {
+		target_hardware_index = 1;
+		drv_data->v4l2.width = 640;
+		drv_data->v4l2.height = 480;
+	}
 
 	up_enforce_format(drv_data, f);
 
-	return 0;
+	drv_data->v4l2.current_hw_index = target_hardware_index;
+
+	dev_info(&drv_data->usb.udev->dev, "Applying resolution payload index %d (%dx%d) to camera...\n",
+		 target_hardware_index, drv_data->v4l2.width, drv_data->v4l2.height);
+
+	return up_set_hardware_resolution(drv_data, target_hardware_index, 30);
 }
 
 static int up_g_fmt_vid_cap(struct file *file, void *priv,
@@ -345,6 +434,13 @@ static int up_start_streaming(struct vb2_queue *vq, unsigned int count)
 	drv_data->decoder.workspace_len = 0;
 	kfifo_reset(&drv_data->decoder.fifo);
 	spin_unlock_irqrestore(&drv_data->pipeline.ready_lock, flags);
+
+	u8 hw_idx = drv_data->v4l2.current_hw_index ? drv_data->v4l2.current_hw_index : 1;
+	retval = up_set_hardware_resolution(drv_data, hw_idx, 30);
+	if (retval) {
+		dev_err(&itf->dev, "up_set_hardware_resolution failed: %d\n", retval);
+		goto error_start;
+	}
 
 	retval = up_iap_auth(drv_data);
 	if (retval) {
