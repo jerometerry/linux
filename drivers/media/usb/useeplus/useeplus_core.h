@@ -39,6 +39,7 @@ enum up_config {
 	HB_SINK_TO = 100,
 	DIAG_LOG_ITERATIONS = 300,
 	USB_TO = 1000,
+	USB_CTRL_SET_TO = 5000,
 };
 
 struct up_buffer {
@@ -73,6 +74,7 @@ struct up_drv_data {
 		struct mutex lock;
 		u32	     height;
 		u32	     width;
+		u8           current_hw_index;
 	} v4l2;
 
 	struct {
