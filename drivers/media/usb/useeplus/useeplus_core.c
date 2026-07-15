@@ -363,7 +363,14 @@ static void up_stop_streaming(struct vb2_queue *vq)
 	drv_data = vb2_get_drv_priv(vq);
 
 	if (test_and_clear_bit(STREAM_HW_ACTIVE, &drv_data->pipeline.streaming)) {
-                up_stop_video(drv_data);
+		up_stop_video(drv_data);
+
+		/*
+		 * Force the host controller to send a SET_INTERFACE packet
+		 * to drop the camera into Alternate Setting 0. This instantly flushes
+		 * the camera's internal FIFOs and stops hardware transmission.
+		 */
+		usb_set_interface(drv_data->usb.udev, UP_VIDEO_INTERFACE, 0);
         }
 
 	/*
@@ -446,6 +453,24 @@ static int up_start_streaming(struct vb2_queue *vq, unsigned int count)
 	drv_data->decoder.workspace_len = 0;
 	kfifo_reset(&drv_data->decoder.fifo);
 	spin_unlock_irqrestore(&drv_data->pipeline.ready_lock, flags);
+
+	/*
+	 * Elevate the interface back to Alternate Setting 1 to power up the lens,
+	 * and clear the endpoint halts to synchronize the USB data toggle bits before
+	 * sending the PROBE and COMMIT resolution negotiation packets.
+	 */
+	retval = usb_set_interface(drv_data->usb.udev, UP_VIDEO_INTERFACE, UP_ALT_VIDEO_ENABLE);
+	if (retval) {
+		dev_err(&itf->dev, "usb_set_interface failed: %d\n", retval);
+		goto error_start;
+	}
+
+	retval = usb_clear_halt(drv_data->usb.udev,
+				usb_rcvbulkpipe(drv_data->usb.udev, drv_data->usb.video_in_ep));
+	if (retval) {
+		dev_err(&itf->dev, "usb_clear_halt failed: %d\n", retval);
+		goto error_start;
+	}
 
 	u8 hw_idx = drv_data->v4l2.current_hw_index ?
 			    drv_data->v4l2.current_hw_index :
@@ -565,8 +590,8 @@ static int up_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 {
 	unsigned int allocated_buffers = vb2_get_num_buffers(vq);
 
-	if (allocated_buffers + *nbuffers < 2)
-		*nbuffers = 2 - allocated_buffers;
+	if (allocated_buffers + *nbuffers < MIN_VB2_REQ_BUFS)
+		*nbuffers = MIN_VB2_REQ_BUFS - allocated_buffers;
 
 	if (*nplanes)
 		return sizes[0] < MAX_FRAME_SIZE ? -EINVAL : 0;
@@ -739,6 +764,8 @@ static void up_on_frame_incomplete(void *context)
 	 * Return the buffer to the V4L2 subsystem with an error state to
 	 * prevent kernel memory starvation and notify userspace of the tear.
 	 */
+	vb2_buf->timestamp = ktime_get_ns();
+	v4l2_buf->sequence = drv_data->pipeline.sequence++;
 	vb2_buffer_done(vb2_buf, VB2_BUF_STATE_ERROR);
 
 	/*
@@ -764,16 +791,15 @@ static void up_on_frame_complete(void *context)
 	v4l2_buf = &active_buf->vb2_buffer;
 	vb2_buf = &v4l2_buf->vb2_buf;
 
+	vb2_buf->timestamp = ktime_get_ns();
+	v4l2_buf->sequence = drv_data->pipeline.sequence++;
+
 	vff_len = drv_data->decoder.active_pl_len;
 	if (vff_len < 2) {
 		drv_data->dbg.frames_dropped_eoi++;
 		vb2_buffer_done(vb2_buf, VB2_BUF_STATE_ERROR);
 	} else {
 		vb2_set_plane_payload(vb2_buf, 0, vff_len);
-
-		vb2_buf->timestamp = ktime_get_ns();
-		v4l2_buf->sequence = drv_data->pipeline.sequence++;
-
 		vb2_buffer_done(vb2_buf, VB2_BUF_STATE_DONE);
 
 		drv_data->dbg.frames_delivered++;
@@ -796,7 +822,11 @@ static void up_on_frame_start(void *context, u8 frame_id, u8 dev_num)
 	if (active_buf) {
 		v4l2_buf = &active_buf->vb2_buffer;
 		vb2_buf = &v4l2_buf->vb2_buf;
+
+		vb2_buf->timestamp = ktime_get_ns();
+		v4l2_buf->sequence = drv_data->pipeline.sequence++;
 		vb2_buffer_done(vb2_buf, VB2_BUF_STATE_ERROR);
+
 		drv_data->decoder.active_buf = NULL;
 	}
 
@@ -838,6 +868,8 @@ static void up_on_video_payload(void *context, u8 *data, size_t len)
 		dev = &drv_data->usb.itf->dev;
 		dev_err_ratelimited(dev, "useeplus: Overflow Prevention.\n");
 
+		vb2_buf->timestamp = ktime_get_ns();
+		v4l2_buf->sequence = drv_data->pipeline.sequence++;
 		vb2_buffer_done(vb2_buf, VB2_BUF_STATE_ERROR);
 
 		drv_data->decoder.active_buf = NULL;
@@ -1154,7 +1186,7 @@ static int up_probe(struct usb_interface *itf, const struct usb_device_id *id)
 	q = &drv_data->v4l2.queue;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_READ;
-	q->min_reqbufs_allocation = 2;
+	q->min_reqbufs_allocation = MIN_VB2_REQ_BUFS;
 	q->drv_priv = drv_data;
 	q->buf_struct_size = sizeof(struct up_buffer);
 	q->ops = &up_vb2_ops;
@@ -1201,18 +1233,17 @@ static int up_probe(struct usb_interface *itf, const struct usb_device_id *id)
 
 	kfree(hb_sink);
 
-	retval = usb_set_interface(usb_dev, UP_VIDEO_INTERFACE,
-				   UP_ALT_VIDEO_ENABLE);
+	/*
+	 * Park the camera in Alternate Setting 0 (dormant mode)
+	 * when it is first plugged in. The stream lifecycle hooks will
+	 * manage elevating it to Alternate Setting 1.
+	 */
+	retval = usb_set_interface(usb_dev, UP_VIDEO_INTERFACE, 0);
 	if (retval) {
 		dev_err(&itf->dev, "usb_set_interface failed with error %d\n",
 			retval);
 		goto error_unreg_v4l2;
 	}
-
-	retval = usb_clear_halt(usb_dev, vid_in_pipe);
-	if (retval)
-		dev_info(&itf->dev, "usb_clear_halt failed with error %d\n",
-			 retval);
 
 	retval = up_alloc_urbs(drv_data);
 	if (retval)
@@ -1266,23 +1297,10 @@ static struct usb_driver up_driver = {
 	.name = USB_DRIVER_NAME,
 };
 
-static void __exit up_exit(void)
-{
-	pr_debug("useeplus_v4l2: Module exited.\n");
-	usb_deregister(&up_driver);
-}
-
-static int __init up_init(void)
-{
-	pr_debug("useeplus_v4l2: Module initialized.\n");
-	return usb_register(&up_driver);
-}
+module_usb_driver(up_driver);
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Jerome Terry");
 MODULE_DESCRIPTION("V4L2 driver for Useeplus protocol cameras");
 MODULE_VERSION("0.1.0");
 MODULE_DEVICE_TABLE(usb, up_table);
-
-module_exit(up_exit);
-module_init(up_init);
