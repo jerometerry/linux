@@ -297,7 +297,6 @@ size_t up_decode_bulk(struct up_decoder *dec, u8 *buf, size_t len)
 			dec->frame_id = state.frame_id;
 			dec->building_frame = true;
 			dec->found_soi = false;
-			dec->dangling_ff = false;
 			dec->eof_reached = false;
 		}
 
@@ -337,12 +336,7 @@ size_t up_decode_bulk(struct up_decoder *dec, u8 *buf, size_t len)
 		}
 
 		img_size = video_data_len;
-		if (dec->dangling_ff && video_data_len > 0 && video_data_ptr[0] == JPEG_EOI) {
-			img_size = 1;
-			dec->eof_reached = true;
-		}
-
-		if (!dec->eof_reached && video_data_len >= 2) {
+		if (video_data_len >= 2) {
 			for (i = 0; i < video_data_len - 1; i++) {
 				if (up_is_jpg_eoi(video_data_ptr, i)) {
 					img_size = i + 2;
@@ -354,11 +348,6 @@ size_t up_decode_bulk(struct up_decoder *dec, u8 *buf, size_t len)
 
 		if (o_vff)
 			o_vff(dec->context, video_data_ptr, img_size);
-
-		if (!dec->eof_reached && video_data_len > 0)
-			dec->dangling_ff = (video_data_ptr[video_data_len - 1] == JPEG_DEL);
-		else
-			dec->dangling_ff = false;
 
 		if (dec->eof_reached && o_vfc)
 			o_vfc(dec->context);
